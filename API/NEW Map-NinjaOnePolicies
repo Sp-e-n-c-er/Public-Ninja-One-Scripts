@@ -1,0 +1,965 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Generates an interactive HTML hierarchy report of all NinjaOne policies,
+    device assignments, and per-device policy section overrides — using the
+    NinjaOne REST API directly with no PowerShell module required.
+ 
+.DESCRIPTION
+    Map-NinjaOnePolicies.ps1 authenticates against the NinjaOne REST API v2
+    using OAuth2 Client Credentials, then collects policies, devices,
+    organisations, locations, and per-device policy section overrides.
+ 
+    A WinForms GUI prompts for API credentials and region on launch, then
+    presents a policy exclusion picker before generating the report.
+ 
+    Output includes:
+      - A dark-mode interactive HTML report with a collapsible policy tree,
+        per-policy device counts (total / inherited / assigned / stale /
+        overrides), colour-coded node class badges, live search, Hide Unused
+        toggle, and a full per-device overrides table.
+      - PolicyReport.csv    — one row per policy with all device statistics.
+      - PolicyOverrides.csv — one row per device that has section overrides,
+        listing the overridden section names.
+ 
+    Compatible with all NinjaOne regions: US, US2, EU, OC, CA.
+    Requires PowerShell 5.1 or later. No third-party modules needed.
+ 
+.NOTES
+    Author  : Spencer A. Heath
+    Version : 2.0
+    GitHub  : https://github.com/SpencerAHeath
+ 
+    AI Assistance
+    -------------
+    This script was developed with the assistance of Claude (Anthropic AI).
+    All logic, structure, and output have been reviewed and tested by the author.
+ 
+    Disclaimer
+    ----------
+    This script is provided "as is" under the MIT License.
+    Use at your own risk. The author assumes no responsibility for damages
+    or issues arising from its use.
+ 
+    Licensed under MIT: (c) Spencer A. Heath. Permission granted to use, copy,
+    modify, and distribute freely, provided this notice remains intact.
+    See https://opensource.org/licenses/MIT for details.
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+###############################################################################
+#  CONSTANTS                                                                  #
+###############################################################################
+$StaleDays   = 30
+$PageSize    = 1000
+$AutoOpen    = $true
+$ExportCSV   = $true
+$Browser     = "msedge"
+$DesktopPath = [Environment]::GetFolderPath("Desktop")
+$HtmlPath    = Join-Path $DesktopPath "PolicyReport.html"
+$CsvPath     = Join-Path $DesktopPath "PolicyReport.csv"
+
+###############################################################################
+#  DARK PALETTE (shared across both forms)                                    #
+###############################################################################
+$cBg      = [System.Drawing.Color]::FromArgb(28,  28,  28)
+$cSurface = [System.Drawing.Color]::FromArgb(44,  44,  44)
+$cInput   = [System.Drawing.Color]::FromArgb(56,  56,  56)
+$cText    = [System.Drawing.Color]::FromArgb(224, 224, 224)
+$cMuted   = [System.Drawing.Color]::FromArgb(150, 150, 150)
+$cAccent  = [System.Drawing.Color]::FromArgb(0,   191, 255)
+$cBtn     = [System.Drawing.Color]::FromArgb(0,   120, 180)
+$cDanger  = [System.Drawing.Color]::FromArgb(244, 67,  54)
+$cBorder  = [System.Drawing.Color]::FromArgb(70,  70,  70)
+
+###############################################################################
+#  FORM 1 — CREDENTIALS                                                       #
+###############################################################################
+$credForm                  = New-Object System.Windows.Forms.Form
+$credForm.Text             = "NinjaOne Policy Report"
+$credForm.ClientSize       = New-Object System.Drawing.Size(430, 298)
+$credForm.StartPosition    = "CenterScreen"
+$credForm.FormBorderStyle  = "FixedDialog"
+$credForm.MaximizeBox      = $false
+$credForm.BackColor        = $cBg
+$credForm.ForeColor        = $cText
+$credForm.Font             = New-Object System.Drawing.Font("Segoe UI", 9)
+
+# Title
+$lCredTitle            = New-Object System.Windows.Forms.Label
+$lCredTitle.Text       = "NinjaOne Policy Report"
+$lCredTitle.Font       = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+$lCredTitle.ForeColor  = $cAccent
+$lCredTitle.Bounds     = [System.Drawing.Rectangle]::new(20, 14, 390, 28)
+$credForm.Controls.Add($lCredTitle)
+
+$lCredSub              = New-Object System.Windows.Forms.Label
+$lCredSub.Text         = "Enter your NinjaOne API credentials to continue"
+$lCredSub.ForeColor    = $cMuted
+$lCredSub.Bounds       = [System.Drawing.Rectangle]::new(20, 44, 390, 18)
+$credForm.Controls.Add($lCredSub)
+
+# Region
+$lRegion               = New-Object System.Windows.Forms.Label
+$lRegion.Text          = "Region"
+$lRegion.Bounds        = [System.Drawing.Rectangle]::new(20, 76, 110, 22)
+$credForm.Controls.Add($lRegion)
+
+$cmbRegion             = New-Object System.Windows.Forms.ComboBox
+$cmbRegion.DropDownStyle = "DropDownList"
+$cmbRegion.BackColor   = $cInput
+$cmbRegion.ForeColor   = $cText
+$cmbRegion.FlatStyle   = "Flat"
+$cmbRegion.Bounds      = [System.Drawing.Rectangle]::new(135, 73, 275, 24)
+@("US   –  app.ninjarmm.com", "US2  –  us2.ninjarmm.com", "EU   –  eu.ninjarmm.com", "OC   –  oc.ninjarmm.com", "CA   –  ca.ninjarmm.com") |
+    ForEach-Object { [void]$cmbRegion.Items.Add($_) }
+$cmbRegion.SelectedIndex = 0
+$credForm.Controls.Add($cmbRegion)
+
+# Client ID
+$lClientId             = New-Object System.Windows.Forms.Label
+$lClientId.Text        = "Client ID"
+$lClientId.Bounds      = [System.Drawing.Rectangle]::new(20, 112, 110, 22)
+$credForm.Controls.Add($lClientId)
+
+$txtClientId           = New-Object System.Windows.Forms.TextBox
+$txtClientId.BackColor = $cInput
+$txtClientId.ForeColor = $cText
+$txtClientId.BorderStyle = "FixedSingle"
+$txtClientId.Bounds    = [System.Drawing.Rectangle]::new(135, 109, 275, 24)
+$credForm.Controls.Add($txtClientId)
+
+# Client Secret
+$lSecret               = New-Object System.Windows.Forms.Label
+$lSecret.Text          = "Client Secret"
+$lSecret.Bounds        = [System.Drawing.Rectangle]::new(20, 148, 110, 22)
+$credForm.Controls.Add($lSecret)
+
+$txtSecret             = New-Object System.Windows.Forms.TextBox
+$txtSecret.BackColor   = $cInput
+$txtSecret.ForeColor   = $cText
+$txtSecret.BorderStyle = "FixedSingle"
+$txtSecret.PasswordChar = [char]0x2022
+$txtSecret.Bounds      = [System.Drawing.Rectangle]::new(135, 145, 275, 24)
+$credForm.Controls.Add($txtSecret)
+
+# Organisation name
+$lOrg                  = New-Object System.Windows.Forms.Label
+$lOrg.Text             = "Organisation"
+$lOrg.Bounds           = [System.Drawing.Rectangle]::new(20, 184, 110, 22)
+$credForm.Controls.Add($lOrg)
+
+$txtOrg                = New-Object System.Windows.Forms.TextBox
+$txtOrg.BackColor      = $cInput
+$txtOrg.ForeColor      = $cText
+$txtOrg.BorderStyle    = "FixedSingle"
+$txtOrg.Text           = "My Organisation"
+$txtOrg.Bounds         = [System.Drawing.Rectangle]::new(135, 181, 275, 24)
+$credForm.Controls.Add($txtOrg)
+
+# Status label
+$lCredStatus           = New-Object System.Windows.Forms.Label
+$lCredStatus.ForeColor = $cDanger
+$lCredStatus.Bounds    = [System.Drawing.Rectangle]::new(20, 216, 390, 18)
+$credForm.Controls.Add($lCredStatus)
+
+# Connect button
+$btnConnect            = New-Object System.Windows.Forms.Button
+$btnConnect.Text       = "Connect & Load Policies  →"
+$btnConnect.Font       = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnConnect.BackColor  = $cBtn
+$btnConnect.ForeColor  = [System.Drawing.Color]::White
+$btnConnect.FlatStyle  = "Flat"
+$btnConnect.FlatAppearance.BorderSize = 0
+$btnConnect.Bounds     = [System.Drawing.Rectangle]::new(135, 250, 275, 34)
+$credForm.Controls.Add($btnConnect)
+$credForm.AcceptButton = $btnConnect
+
+$script:credOK = $false
+$btnConnect.Add_Click({
+    if (-not $txtClientId.Text.Trim() -or -not $txtSecret.Text.Trim()) {
+        $lCredStatus.Text = "Client ID and Secret are required."
+        return
+    }
+    $script:credOK = $true
+    $credForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $credForm.Close()
+})
+
+[void]$credForm.ShowDialog()
+if (-not $script:credOK) { exit 0 }
+
+$NinjaClientId     = $txtClientId.Text.Trim()
+$NinjaClientSecret = $txtSecret.Text.Trim()
+$NinjaBaseUrl      = @{0="https://app.ninjarmm.com";  1="https://us2.ninjarmm.com";
+                       2="https://eu.ninjarmm.com";  3="https://oc.ninjarmm.com";
+                       4="https://ca.ninjarmm.com"}[$cmbRegion.SelectedIndex]
+$OrganizationName  = if ($txtOrg.Text.Trim()) { $txtOrg.Text.Trim() } else { "NinjaOne" }
+
+###############################################################################
+#  AUTHENTICATE                                                               #
+###############################################################################
+Write-Host "Authenticating..." -ForegroundColor Cyan
+try {
+    $tokenResp = Invoke-RestMethod -Uri "$NinjaBaseUrl/ws/oauth/token" `
+        -Method Post -ContentType "application/x-www-form-urlencoded" `
+        -Body @{ grant_type="client_credentials"; client_id=$NinjaClientId;
+                 client_secret=$NinjaClientSecret; scope="monitoring" } -ErrorAction Stop
+} catch {
+    [System.Windows.Forms.MessageBox]::Show("Authentication failed:`n$_","Auth Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
+    exit 1
+}
+$authHeader = @{ Authorization = "Bearer $($tokenResp.access_token)" }
+Write-Host "Authenticated." -ForegroundColor Green
+
+###############################################################################
+#  FETCH POLICIES (needed before exclusion picker opens)                      #
+###############################################################################
+Write-Host "Fetching policies..." -ForegroundColor Cyan
+try {
+    $allPolicies = Invoke-RestMethod -Uri "$NinjaBaseUrl/v2/policies" -Headers $authHeader -ErrorAction Stop
+} catch {
+    [System.Windows.Forms.MessageBox]::Show("Failed to fetch policies:`n$_","Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
+    exit 1
+}
+Write-Host "  $($allPolicies.Count) policies loaded." -ForegroundColor Gray
+
+###############################################################################
+#  FORM 2 — POLICY EXCLUSION PICKER                                           #
+###############################################################################
+$exclForm                  = New-Object System.Windows.Forms.Form
+$exclForm.Text             = "Policy Exclusions  —  $($allPolicies.Count) policies found"
+$exclForm.ClientSize       = New-Object System.Drawing.Size(500, 540)
+$exclForm.StartPosition    = "CenterScreen"
+$exclForm.FormBorderStyle  = "FixedDialog"
+$exclForm.MaximizeBox      = $false
+$exclForm.BackColor        = $cBg
+$exclForm.ForeColor        = $cText
+$exclForm.Font             = New-Object System.Drawing.Font("Segoe UI", 9)
+
+$lExclTitle                = New-Object System.Windows.Forms.Label
+$lExclTitle.Text           = "Exclude Policies from Report"
+$lExclTitle.Font           = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+$lExclTitle.ForeColor      = $cAccent
+$lExclTitle.Bounds         = [System.Drawing.Rectangle]::new(16, 14, 468, 26)
+$exclForm.Controls.Add($lExclTitle)
+
+$lExclSub                  = New-Object System.Windows.Forms.Label
+$lExclSub.Text             = "Tick any policies to exclude them from the report. Leave all unticked to include everything."
+$lExclSub.ForeColor        = $cMuted
+$lExclSub.Bounds           = [System.Drawing.Rectangle]::new(16, 42, 468, 18)
+$exclForm.Controls.Add($lExclSub)
+
+# Filter textbox
+$txtExclFilter             = New-Object System.Windows.Forms.TextBox
+$txtExclFilter.BackColor   = $cInput
+$txtExclFilter.ForeColor   = $cMuted
+$txtExclFilter.BorderStyle = "FixedSingle"
+$txtExclFilter.Text        = "Filter by name or node class..."
+$txtExclFilter.Bounds      = [System.Drawing.Rectangle]::new(16, 68, 468, 24)
+$exclForm.Controls.Add($txtExclFilter)
+
+# Checked listbox
+$clb                       = New-Object System.Windows.Forms.CheckedListBox
+$clb.BackColor             = $cSurface
+$clb.ForeColor             = $cText
+$clb.BorderStyle           = "None"
+$clb.CheckOnClick          = $true
+$clb.Bounds                = [System.Drawing.Rectangle]::new(16, 100, 468, 370)
+$exclForm.Controls.Add($clb)
+
+# Sort policies and build a label → id map
+$sortedPolicies   = @($allPolicies | Sort-Object nodeClass, name)
+$script:exclIds   = [System.Collections.Generic.HashSet[int]]::new()
+
+# Build label string for a policy
+function Get-PolicyLabel { param($p); return "[$($p.nodeClass)]   $($p.name)" }
+
+function Rebuild-ExclList {
+    param([string]$filter = "")
+    $clb.Items.Clear()
+    foreach ($p in $sortedPolicies) {
+        $filterActive = $filter -and ($filter -ne "Filter by name or node class...")
+        if ($filterActive) {
+            $hit = ($p.name -match [regex]::Escape($filter)) -or ($p.nodeClass -match [regex]::Escape($filter))
+            if (-not $hit) { continue }
+        }
+        $label   = Get-PolicyLabel $p
+        $checked = $script:exclIds.Contains([int]$p.id)
+        [void]$clb.Items.Add($label, $checked)
+    }
+}
+Rebuild-ExclList
+
+# Keep checked state in sync across filter rebuilds
+$clb.Add_ItemCheck({
+    param($s, $e)
+    $label = $clb.Items[$e.Index]
+    $match = $sortedPolicies | Where-Object { (Get-PolicyLabel $_) -eq $label } | Select-Object -First 1
+    if (-not $match) { return }
+    $polId = [int]$match.id
+    if ($e.NewValue -eq 'Checked')   { [void]$script:exclIds.Add($polId)    }
+    if ($e.NewValue -eq 'Unchecked') { [void]$script:exclIds.Remove($polId) }
+})
+
+$txtExclFilter.Add_Enter({
+    if ($txtExclFilter.Text -eq "Filter by name or node class...") {
+        $txtExclFilter.Text = ""; $txtExclFilter.ForeColor = $cText
+    }
+})
+$txtExclFilter.Add_Leave({
+    if ($txtExclFilter.Text -eq "") {
+        $txtExclFilter.Text = "Filter by name or node class..."; $txtExclFilter.ForeColor = $cMuted
+    }
+})
+$txtExclFilter.Add_TextChanged({ Rebuild-ExclList -filter $txtExclFilter.Text })
+
+# Buttons
+$btnGenerate               = New-Object System.Windows.Forms.Button
+$btnGenerate.Text          = "Generate Report  →"
+$btnGenerate.Font          = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnGenerate.BackColor     = $cBtn
+$btnGenerate.ForeColor     = [System.Drawing.Color]::White
+$btnGenerate.FlatStyle     = "Flat"
+$btnGenerate.FlatAppearance.BorderSize = 0
+$btnGenerate.Bounds        = [System.Drawing.Rectangle]::new(293, 492, 191, 34)
+$exclForm.Controls.Add($btnGenerate)
+
+$btnNoExcl                 = New-Object System.Windows.Forms.Button
+$btnNoExcl.Text            = "No Exclusions"
+$btnNoExcl.BackColor       = $cSurface
+$btnNoExcl.ForeColor       = $cText
+$btnNoExcl.FlatStyle       = "Flat"
+$btnNoExcl.FlatAppearance.BorderSize  = 1
+$btnNoExcl.FlatAppearance.BorderColor = $cBorder
+$btnNoExcl.Bounds          = [System.Drawing.Rectangle]::new(16, 492, 150, 34)
+$exclForm.Controls.Add($btnNoExcl)
+
+$script:exclOK = $false
+$btnGenerate.Add_Click({
+    $script:exclOK = $true
+    $exclForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $exclForm.Close()
+})
+$btnNoExcl.Add_Click({
+    $script:exclIds.Clear()
+    $script:exclOK = $true
+    $exclForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $exclForm.Close()
+})
+
+$exclForm.AcceptButton = $btnGenerate
+[void]$exclForm.ShowDialog()
+if (-not $script:exclOK) { exit 0 }
+
+$ExcludedPolicyIds = $script:exclIds
+
+###############################################################################
+#  REST HELPERS                                                               #
+###############################################################################
+function Invoke-NinjaGet {
+    param([string]$Endpoint)
+    try {
+        return Invoke-RestMethod -Uri "$NinjaBaseUrl$Endpoint" -Headers $authHeader -Method Get -ErrorAction Stop
+    } catch {
+        Write-Warning "GET $Endpoint failed: $_"
+        return @()
+    }
+}
+
+function Invoke-NinjaPagedGet {
+    param([string]$Endpoint)
+    $results = [System.Collections.Generic.List[object]]::new()
+    $after   = $null
+    do {
+        $qs  = "pageSize=$PageSize" + $(if ($after) { "&after=$after" } else { "" })
+        $uri = "$NinjaBaseUrl$Endpoint`?$qs"
+        try {
+            $page = Invoke-RestMethod -Uri $uri -Headers $authHeader -Method Get -ErrorAction Stop
+        } catch {
+            Write-Warning "Paged GET $Endpoint failed: $_"
+            break
+        }
+        if (-not $page -or $page.Count -eq 0) { break }
+        $results.AddRange([object[]]$page)
+        if ($page.Count -lt $PageSize) { break }
+        $after = ($page | Select-Object -Last 1).id
+    } while ($true)
+    return $results.ToArray()
+}
+
+function Invoke-NinjaCursorGet {
+    # Used for endpoints that return { cursor: {...}, results: [...] }
+    # e.g. /v2/queries/policy-overrides
+    param([string]$Endpoint)
+    $results    = [System.Collections.Generic.List[object]]::new()
+    $cursorName = $null
+    do {
+        $qs  = "pageSize=$PageSize" + $(if ($cursorName) { "&cursor=$cursorName" } else { "" })
+        $uri = "$NinjaBaseUrl$Endpoint`?$qs"
+        try {
+            $resp = Invoke-RestMethod -Uri $uri -Headers $authHeader -Method Get -ErrorAction Stop
+        } catch {
+            Write-Warning "Cursor GET $Endpoint failed: $_"
+            break
+        }
+        $page = $resp.results
+        if (-not $page -or $page.Count -eq 0) { break }
+        $results.AddRange([object[]]$page)
+        if ($page.Count -lt $PageSize) { break }
+        $cursorName = $resp.cursor.name
+    } while ($cursorName)
+    return $results.ToArray()
+}
+
+###############################################################################
+#  DATA COLLECTION                                                             #
+###############################################################################
+Write-Host "Fetching devices..."        -ForegroundColor Cyan
+$allDevices   = Invoke-NinjaPagedGet -Endpoint "/v2/devices"
+
+Write-Host "Fetching organisations..."  -ForegroundColor Cyan
+$allOrgs      = Invoke-NinjaPagedGet -Endpoint "/v2/organizations"
+
+Write-Host "Fetching locations..."      -ForegroundColor Cyan
+$allLocations = Invoke-NinjaPagedGet -Endpoint "/v2/locations"
+
+Write-Host "Fetching policy overrides..."  -ForegroundColor Cyan
+$allOverrides = Invoke-NinjaCursorGet -Endpoint "/v2/queries/policy-overrides"
+
+$TotalDeviceCount = $allDevices.Count
+$ReportDate       = Get-Date -Format "yyyy-MM-dd HH:mm"
+
+Write-Host "  Devices  : $TotalDeviceCount"           -ForegroundColor Gray
+Write-Host "  Orgs     : $($allOrgs.Count)"           -ForegroundColor Gray
+Write-Host "  Locations: $($allLocations.Count)"      -ForegroundColor Gray
+Write-Host "  Overrides: $($allOverrides.Count) devices with overrides" -ForegroundColor Gray
+
+###############################################################################
+#  LOOKUP TABLES                                                              #
+###############################################################################
+$orgLookup = @{}
+foreach ($o in $allOrgs)      { $orgLookup[[int]$o.id]  = $o.name }
+
+$locLookup = @{}
+foreach ($l in $allLocations) { $locLookup[[int]$l.id]  = $l.name }
+
+###############################################################################
+#  PER-POLICY DEVICE STATS                                                    #
+# FIX: cast all IDs to [int] so hashtable key lookups never silently fail    #
+# FIX: explicit null/zero guard for policyId to correctly identify inherited #
+###############################################################################
+$staleThreshold = (Get-Date).AddDays(-$StaleDays)
+$deviceStats    = @{}
+
+foreach ($device in $allDevices) {
+    # policyId is only present when there is an explicit override.
+    # rolePolicyId is the role/location inherited policy — always present.
+    $rawPid  = $device.policyId
+    $rawRid  = $device.rolePolicyId
+
+    $isAssigned    = ($null -ne $rawPid) -and ("$rawPid" -ne "") -and ([int]$rawPid -ne 0)
+    $effectivePid  = if ($isAssigned) { [int]$rawPid } else { [int]$rawRid }
+    if (-not $effectivePid) { continue }
+
+    if (-not $deviceStats.ContainsKey($effectivePid)) {
+        $deviceStats[$effectivePid] = @{
+            Total        = 0
+            Inherited    = 0
+            Assigned     = 0
+            Stale        = 0
+            WithOverrides = 0
+            Orgs         = [System.Collections.Generic.HashSet[string]]::new()
+        }
+    }
+
+    $s = $deviceStats[$effectivePid]
+    $s['Total']++
+    if ($isAssigned) { $s['Assigned']++  }
+    else             { $s['Inherited']++ }
+
+    if ($device.lastContact) {
+        try {
+            $lc = [DateTimeOffset]::FromUnixTimeSeconds([long]$device.lastContact).LocalDateTime
+            if ($lc -lt $staleThreshold) { $s['Stale']++ }
+        } catch {}
+    }
+
+    if ($device.organizationId -and $orgLookup.ContainsKey([int]$device.organizationId)) {
+        [void]$s['Orgs'].Add($orgLookup[[int]$device.organizationId])
+    }
+}
+
+###############################################################################
+#  OVERRIDE LOOKUPS                                                           #
+# Build two tables:                                                           #
+#   $overridesByDevice  – deviceId  → array of overridden section strings    #
+#   $devicePolicyMap    – deviceId  → effective policyId (for cross-ref)     #
+# Then roll up WithOverrides count into each policy's deviceStats bucket.    #
+###############################################################################
+
+# Device name + effective policy lookup (built from the same device data)
+$deviceNameMap   = @{}
+$devicePolicyMap = @{}
+foreach ($d in $allDevices) {
+    $did  = [int]$d.id
+    $deviceNameMap[$did] = if ($d.displayName) { $d.displayName }
+                           elseif ($d.systemName) { $d.systemName }
+                           else { "Device $did" }
+
+    $rawPid2     = $d.policyId
+    $isAssigned2 = ($null -ne $rawPid2) -and ("$rawPid2" -ne "") -and ([int]$rawPid2 -ne 0)
+    $devicePolicyMap[$did] = if ($isAssigned2) { [int]$rawPid2 } else { [int]$d.rolePolicyId }
+}
+
+# deviceId → list of overridden section strings
+$overridesByDevice = @{}
+foreach ($row in $allOverrides) {
+    $did = [int]$row.deviceId
+    $overridesByDevice[$did] = $row.overrides   # array of strings
+
+    # Roll up into the policy's WithOverrides counter
+    if ($devicePolicyMap.ContainsKey($did)) {
+        $polId2 = $devicePolicyMap[$did]
+        if ($deviceStats.ContainsKey($polId2)) {
+            $deviceStats[$polId2]['WithOverrides']++
+        }
+    }
+}
+
+$totalWithOverrides = $allOverrides.Count
+
+###############################################################################
+#  SUMMARY COUNTERS                                                           #
+###############################################################################
+# Filter out excluded policies for reporting purposes
+$reportPolicies      = @($allPolicies | Where-Object { -not $ExcludedPolicyIds.Contains([int]$_.id) })
+$TotalPolicyCount    = $reportPolicies.Count
+$policiesWithDevices = ($reportPolicies | Where-Object { $deviceStats.ContainsKey([int]$_.id) }).Count
+$policiesUnused      = $TotalPolicyCount - $policiesWithDevices
+$totalStale          = ($deviceStats.Values | ForEach-Object { $_['Stale'] } | Measure-Object -Sum).Sum
+
+###############################################################################
+#  POLICY TREE BUILDER                                                        #
+###############################################################################
+function Get-PolicyTree {
+    param($policies, $parentId = $null)
+    $children = $policies | Where-Object { $_.parentPolicyId -eq $parentId }
+    foreach ($child in $children) {
+        $child | Add-Member -MemberType NoteProperty -Name 'Children' -Value @() -Force
+        $polId = [int]$child.id
+        $stats = if ($deviceStats.ContainsKey($polId)) { $deviceStats[$polId] }
+                 else { @{ Total=0; Inherited=0; Assigned=0; Stale=0; WithOverrides=0; Orgs=@() } }
+        $child | Add-Member -MemberType NoteProperty -Name 'Stats' -Value $stats -Force
+        $child.Children = Get-PolicyTree -policies $policies -parentId $child.id
+    }
+    return $children
+}
+
+$policyTree = Get-PolicyTree -policies $reportPolicies -parentId $null
+
+###############################################################################
+#  NODE-CLASS COLOUR MAP                                                      #
+###############################################################################
+$ncColors = @{
+    WINDOWS_WORKSTATION         = '#4fc3f7'
+    WINDOWS_SERVER              = '#81d4fa'
+    MAC                         = '#a5d6a7'
+    MAC_SERVER                  = '#66bb6a'
+    LINUX_WORKSTATION           = '#ffcc80'
+    LINUX_SERVER                = '#ffa726'
+    ANDROID                     = '#ce93d8'
+    APPLE_IOS                   = '#80cbc4'
+    APPLE_IPADOS                = '#4db6ac'
+    VMWARE_VM_HOST              = '#ef9a9a'
+    VMWARE_VM_GUEST             = '#e57373'
+    HYPERV_VMM_HOST             = '#f48fb1'
+    HYPERV_VMM_GUEST            = '#f06292'
+    CLOUD_MONITOR_TARGET        = '#ffe082'
+    NMS_SWITCH                  = '#b0bec5'
+    NMS_ROUTER                  = '#90a4ae'
+    NMS_FIREWALL                = '#ff8a65'
+    NMS_PRINTER                 = '#a1887f'
+    UNMANAGED_DEVICE            = '#757575'
+    MANAGED_DEVICE              = '#9e9e9e'
+}
+function Get-NcColor { param($nc)
+    if ($ncColors.ContainsKey($nc)) { return $ncColors[$nc] }
+    return '#aaaaaa'
+}
+
+###############################################################################
+#  HTML TREE RENDERER                                                         #
+###############################################################################
+function Convert-TreeToHTML {
+    param($tree)
+    if ($tree.Count -eq 0) { return "" }
+    $html = "<ul>"
+    foreach ($p in $tree) {
+        $s            = $p.Stats
+        $total        = [int]$s['Total']
+        $inherited    = [int]$s['Inherited']
+        $assigned     = [int]$s['Assigned']
+        $stale        = [int]$s['Stale']
+        $withOverrides = [int]$s['WithOverrides']
+        $color        = Get-NcColor -nc $p.nodeClass
+
+        $defaultBadge   = if ($p.nodeClassDefault) { "<span class='badge badge-default'>DEFAULT</span>" } else { "" }
+        $staleBadge     = if ($stale -gt 0)         { "<span class='badge badge-stale'>$stale STALE</span>" } else { "" }
+        $overrideBadge  = if ($withOverrides -gt 0) { "<span class='badge badge-override'>$withOverrides overrides</span>" } else { "" }
+
+        $orgList    = if ($s['Orgs'] -and $s['Orgs'].Count -gt 0) { $s['Orgs'] -join ", " } else { "—" }
+        $updatedStr = if ($p.updated) {
+            try { [DateTimeOffset]::FromUnixTimeSeconds([long]$p.updated).LocalDateTime.ToString("yyyy-MM-dd") }
+            catch { "—" }
+        } else { "—" }
+        $descBlock  = if ($p.description) {
+            $esc = [System.Web.HttpUtility]::HtmlEncode($p.description)
+            "<div class='policy-desc'>$esc</div>"
+        } else { "" }
+
+        $toggleBtn  = if ($p.Children.Count -gt 0) {
+            "<button class='toggle-btn' onclick='toggleNode(this)'>&#9660;</button>"
+        } else { "" }
+
+        $nameEsc = [System.Web.HttpUtility]::HtmlEncode($p.name)
+
+        $html += @"
+<li data-total="$total">
+  <div class='policy-header'>
+    $toggleBtn
+    <span class='policy-name'>$nameEsc</span>
+    $defaultBadge $staleBadge $overrideBadge
+  </div>
+  $descBlock
+  <div class='policy-meta'>
+    <span class='nc-badge' style='background:$color'>$($p.nodeClass)</span>
+    <span class='meta-item'>ID: $($p.id)</span>
+    <span class='meta-item'>Updated: $updatedStr</span>
+  </div>
+  <div class='device-summary'>
+    <span class='ds-total'>&#128421; $total devices</span>
+    <span class='ds-inherited'>&#8627; $inherited inherited</span>
+    <span class='ds-assigned'>&#128279; $assigned assigned</span>
+  </div>
+  <div class='org-list'>&#127970; Organisations: $orgList</div>
+$(Convert-TreeToHTML -tree $p.Children)
+</li>
+"@
+    }
+    $html += "</ul>"
+    return $html
+}
+
+###############################################################################
+#  INLINE CSS                                                                 #
+###############################################################################
+$css = @'
+<style>
+:root{
+  --bg:#1e1e1e;--surface:#2c2c2c;--surface2:#383838;
+  --accent:#00bfff;--text:#e0e0e0;--muted:#aaaaaa;
+  --green:#4caf50;--red:#f44336;--orange:#ff9800;--yellow:#ffeb3b;
+}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
+
+.report-header{background:var(--surface);border-radius:12px;padding:22px 28px;margin-bottom:20px;
+  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;
+  border-left:5px solid var(--accent)}
+.report-header h1{color:var(--accent);margin:0;font-size:1.7em}
+.subtitle{color:var(--muted);font-size:.9em;margin-top:4px}
+
+.stats-bar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
+.stat-card{background:var(--surface);border-radius:10px;padding:12px 18px;flex:1;min-width:120px;
+  border-top:3px solid var(--accent)}
+.stat-card .val{font-size:1.9em;font-weight:bold;color:var(--accent)}
+.stat-card .lbl{font-size:.75em;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.stat-card.green{border-color:var(--green)}.stat-card.green .val{color:var(--green)}
+.stat-card.red  {border-color:var(--red)  }.stat-card.red   .val{color:var(--red)  }
+.stat-card.orange{border-color:var(--orange)}.stat-card.orange .val{color:var(--orange)}
+
+.toolbar{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+.toolbar input{background:var(--surface);border:1px solid #555;color:var(--text);
+  padding:9px 13px;border-radius:8px;font-size:.95em;flex:1;min-width:200px;outline:none}
+.toolbar input:focus{border-color:var(--accent)}
+.toolbar button{background:var(--surface2);border:1px solid #555;color:var(--text);
+  padding:9px 14px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:.9em}
+.toolbar button:hover{background:var(--accent);color:#000;border-color:var(--accent)}
+.toolbar button.active{background:var(--orange);color:#000;border-color:var(--orange)}
+
+ul{list-style:none;margin:0 0 0 22px;padding:0;border-left:2px solid #444}
+#policyTree>ul{margin-left:0;border-left:none}
+li{margin:7px 0;padding:11px 13px;background:var(--surface);border-radius:8px;position:relative}
+li::before{content:'';position:absolute;top:21px;left:-22px;width:20px;height:2px;background:#444}
+
+.policy-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.policy-name{font-size:1.05em;font-weight:bold;color:#fff}
+.policy-desc{font-size:.82em;color:var(--muted);margin:4px 0 5px;font-style:italic}
+
+.policy-meta{display:flex;align-items:center;gap:10px;margin:5px 0;flex-wrap:wrap}
+.nc-badge{font-size:.7em;padding:2px 8px;border-radius:20px;color:#000;font-weight:bold}
+.meta-item{font-size:.78em;color:var(--muted)}
+
+.device-summary{display:flex;gap:12px;flex-wrap:wrap;font-size:.83em;margin:5px 0}
+.ds-total{color:var(--accent)}.ds-inherited{color:#aaa}.ds-assigned{color:var(--orange)}
+
+.org-list{font-size:.78em;color:var(--muted);margin-top:3px}
+
+.badge{font-size:.66em;padding:2px 7px;border-radius:12px;font-weight:bold;vertical-align:middle}
+.badge-default{background:var(--accent);color:#000}
+.badge-stale{background:var(--orange);color:#000}
+.badge-override{background:#9c27b0;color:#fff}
+
+.overrides-section{margin-top:32px}
+.overrides-section h2{color:var(--accent);font-size:1.2em;margin-bottom:12px;
+  padding-bottom:6px;border-bottom:1px solid #444}
+.ov-table{width:100%;border-collapse:collapse;font-size:.88em}
+.ov-table th{background:var(--surface2);color:var(--muted);text-align:left;
+  padding:8px 12px;font-weight:600;text-transform:uppercase;font-size:.75em;letter-spacing:.04em}
+.ov-table td{padding:8px 12px;border-bottom:1px solid #333;vertical-align:top}
+.ov-table tr:hover td{background:var(--surface2)}
+.ov-table .device-name{color:#fff;font-weight:500}
+.ov-table .policy-ref{color:var(--muted);font-size:.85em}
+.section-pill{display:inline-block;background:#3a1a4a;color:#ce93d8;
+  font-size:.72em;padding:2px 7px;border-radius:10px;margin:2px 2px 0 0}
+
+.toggle-btn{background:none;border:1px solid #555;color:var(--muted);border-radius:4px;
+  padding:0 5px;cursor:pointer;font-size:.78em;line-height:1.6;transition:transform .15s}
+.toggle-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+li.is-collapsed>.toggle-btn{transform:rotate(-90deg)}
+li.is-collapsed>ul{display:none}
+li.is-hidden{display:none}
+
+.report-footer{margin-top:28px;font-size:.76em;color:#555;text-align:center}
+</style>
+'@
+
+###############################################################################
+#  INLINE JS                                                                  #
+###############################################################################
+$js = @'
+<script>
+function toggleNode(btn){
+  btn.closest('li').classList.toggle('is-collapsed');
+}
+function expandAll(){
+  document.querySelectorAll('#policyTree li').forEach(function(el){
+    el.classList.remove('is-collapsed');
+  });
+}
+function collapseAll(){
+  document.querySelectorAll('#policyTree li').forEach(function(el){
+    if(el.querySelector(':scope>ul')) el.classList.add('is-collapsed');
+  });
+}
+
+// Search: match on policy name or node class text
+function filterPolicies(){
+  var q=document.getElementById('searchInput').value.toLowerCase().trim();
+  var all=document.querySelectorAll('#policyTree li');
+  all.forEach(function(li){
+    if(li.classList.contains('unused-hidden')) return;
+    var name=(li.querySelector('.policy-name')||{innerText:''}).innerText.toLowerCase();
+    var nc  =(li.querySelector('.nc-badge')   ||{innerText:''}).innerText.toLowerCase();
+    li.classList.toggle('is-hidden', q!=='' && name.indexOf(q)===-1 && nc.indexOf(q)===-1);
+  });
+  // Reveal parents of visible items
+  if(q!==''){
+    all.forEach(function(li){
+      if(!li.classList.contains('is-hidden') && !li.classList.contains('unused-hidden')){
+        var p=li.parentElement;
+        while(p && p.id!=='policyTree'){
+          if(p.tagName==='LI'){p.classList.remove('is-hidden');}
+          p=p.parentElement;
+        }
+      }
+    });
+  }
+}
+
+// Hide / show policies with zero devices
+var unusedHidden = false;
+function toggleUnused(){
+  unusedHidden = !unusedHidden;
+  var btn=document.getElementById('btnUnused');
+  btn.classList.toggle('active', unusedHidden);
+  btn.textContent = unusedHidden ? 'Show Unused' : 'Hide Unused';
+  document.querySelectorAll('#policyTree li').forEach(function(li){
+    var total = parseInt(li.getAttribute('data-total')||'0', 10);
+    if(total === 0){
+      li.classList.toggle('unused-hidden', unusedHidden);
+      li.classList.toggle('is-hidden',     unusedHidden);
+    }
+  });
+}
+</script>
+'@
+
+###############################################################################
+#  BUILD FULL HTML                                                             #
+###############################################################################
+$policyHTML = Convert-TreeToHTML -tree $policyTree
+$orgCount   = $allOrgs.Count
+
+# Build policy name lookup for the overrides table
+$policyNameMap = @{}
+foreach ($pol in $allPolicies) { $policyNameMap[[int]$pol.id] = $pol.name }
+
+# Build overrides table HTML
+if ($allOverrides.Count -gt 0) {
+    $ovRows = $allOverrides |
+        Sort-Object { $deviceNameMap[[int]$_.deviceId] } |
+        ForEach-Object {
+            $did      = [int]$_.deviceId
+            $dName    = if ($deviceNameMap.ContainsKey($did)) { [System.Web.HttpUtility]::HtmlEncode($deviceNameMap[$did]) } else { "Device $did" }
+            $polId3   = if ($devicePolicyMap.ContainsKey($did)) { $devicePolicyMap[$did] } else { 0 }
+            $polName  = if ($polId3 -and $policyNameMap.ContainsKey($polId3)) { [System.Web.HttpUtility]::HtmlEncode($policyNameMap[$polId3]) } else { "—" }
+            $pills    = ($_.overrides | ForEach-Object { "<span class='section-pill'>$_</span>" }) -join ""
+            "<tr><td class='device-name'>$dName<br><span class='policy-ref'>Policy: $polName</span></td><td>$pills</td></tr>"
+        }
+    $ovTableHTML = @"
+<div class="overrides-section">
+  <h2>&#9881; Devices with Policy Section Overrides ($totalWithOverrides)</h2>
+  <table class="ov-table">
+    <thead><tr><th>Device</th><th>Overridden Sections</th></tr></thead>
+    <tbody>
+$($ovRows -join "`n")
+    </tbody>
+  </table>
+</div>
+"@
+} else {
+    $ovTableHTML = "<div class='overrides-section' style='color:var(--muted);font-size:.9em'>No per-device policy section overrides found.</div>"
+}
+
+$fullHTML = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NinjaOne Policy Report – $OrganizationName</title>
+  $css
+</head>
+<body>
+
+<div class="report-header">
+  <div>
+    <h1>$OrganizationName</h1>
+    <div class="subtitle">NinjaOne Hierarchy Policy Report &mdash; Generated: $ReportDate</div>
+  </div>
+  <div style="text-align:right;color:var(--muted);font-size:.82em">NinjaOne REST API v2</div>
+</div>
+
+<div class="stats-bar">
+  <div class="stat-card">
+    <div class="val">$TotalPolicyCount</div><div class="lbl">Total Policies</div>
+  </div>
+  <div class="stat-card green">
+    <div class="val">$policiesWithDevices</div><div class="lbl">Policies In Use</div>
+  </div>
+  <div class="stat-card red">
+    <div class="val">$policiesUnused</div><div class="lbl">Unused Policies</div>
+  </div>
+  <div class="stat-card">
+    <div class="val">$TotalDeviceCount</div><div class="lbl">Total Devices</div>
+  </div>
+  <div class="stat-card orange">
+    <div class="val">$totalStale</div><div class="lbl">Stale (&gt;$($StaleDays)d)</div>
+  </div>
+  <div class="stat-card">
+    <div class="val">$orgCount</div><div class="lbl">Organisations</div>
+  </div>
+  <div class="stat-card" style="border-color:#9c27b0">
+    <div class="val" style="color:#ce93d8">$totalWithOverrides</div><div class="lbl">Device Overrides</div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <input id="searchInput" type="text" placeholder="Search policy name or node class..." oninput="filterPolicies()">
+  <button id="btnUnused" onclick="toggleUnused()">Hide Unused</button>
+  <button onclick="expandAll()">Expand All</button>
+  <button onclick="collapseAll()">Collapse All</button>
+</div>
+
+<div id="policyTree">
+$policyHTML
+</div>
+
+$ovTableHTML
+
+<div class="report-footer">
+  Generated by Map-NinjaOnePolicies.ps1 &bull; $OrganizationName &bull; $ReportDate
+</div>
+
+$js
+</body>
+</html>
+"@
+
+###############################################################################
+#  WRITE HTML                                                                 #
+###############################################################################
+$fullHTML | Out-File -FilePath $HtmlPath -Encoding UTF8
+Write-Host "HTML report saved: $HtmlPath" -ForegroundColor Green
+
+###############################################################################
+#  OPTIONAL CSV EXPORT                                                        #
+###############################################################################
+if ($ExportCSV) {
+    $csvRows = foreach ($p in $reportPolicies) {
+        $polId = [int]$p.id
+        $s   = if ($deviceStats.ContainsKey($polId)) { $deviceStats[$polId] }
+               else { @{ Total=0; Inherited=0; Assigned=0; Stale=0; Orgs=@() } }
+        $updStr = if ($p.updated) {
+            try { [DateTimeOffset]::FromUnixTimeSeconds([long]$p.updated).LocalDateTime.ToString("yyyy-MM-dd") } catch { "" }
+        } else { "" }
+        [PSCustomObject]@{
+            PolicyID         = $polId
+            PolicyName       = $p.name
+            Description      = $p.description
+            NodeClass        = $p.nodeClass
+            ParentPolicyID   = $p.parentPolicyId
+            IsDefaultPolicy  = $p.nodeClassDefault
+            LastUpdated      = $updStr
+            TotalDevices          = $s['Total']
+            InheritedDevices      = $s['Inherited']
+            AssignedDevices       = $s['Assigned']
+            StaleDevices          = $s['Stale']
+            DevicesWithOverrides  = $s['WithOverrides']
+            Organisations         = ($s['Orgs'] -join "; ")
+        }
+    }
+    $csvRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "CSV export saved:  $CsvPath" -ForegroundColor Green
+
+    # Second CSV – per-device override detail
+    if ($allOverrides.Count -gt 0) {
+        $ovCsvPath = Join-Path $DesktopPath "PolicyOverrides.csv"
+        $ovCsvRows = $allOverrides | ForEach-Object {
+            $did    = [int]$_.deviceId
+            $polId4 = if ($devicePolicyMap.ContainsKey($did)) { $devicePolicyMap[$did] } else { 0 }
+            [PSCustomObject]@{
+                DeviceID          = $did
+                DeviceName        = if ($deviceNameMap.ContainsKey($did)) { $deviceNameMap[$did] } else { "" }
+                EffectivePolicyID = $polId4
+                PolicyName        = if ($polId4 -and $policyNameMap.ContainsKey($polId4)) { $policyNameMap[$polId4] } else { "" }
+                OverriddenSections = ($_.overrides -join "; ")
+            }
+        }
+        $ovCsvRows | Export-Csv -Path $ovCsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "Overrides CSV saved: $ovCsvPath" -ForegroundColor Green
+    }
+}
+
+###############################################################################
+#  OPEN REPORT                                                                #
+###############################################################################
+if ($AutoOpen) { Start-Process $Browser $HtmlPath }
